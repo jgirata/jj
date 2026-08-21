@@ -43,6 +43,7 @@ use crate::cli_util::compute_commit_location;
 use crate::cli_util::print_unmatched_explicit_paths;
 use crate::command_error::CommandError;
 use crate::complete;
+use crate::description_util::TextEditor;
 use crate::description_util::add_trailers;
 use crate::description_util::description_template;
 use crate::description_util::edit_description;
@@ -292,6 +293,41 @@ pub(crate) async fn cmd_split(
     // Prompt the user to select the changes they want for the first commit.
     let target = select_diff(ui, &tx, &target_commit, &matcher, &diff_selector).await?;
 
+    let target_tree = target.commit.tree();
+    let second_tree = if parallel {
+        // Merge the original commit tree with its parent using the tree
+        // containing the user selected changes as the base for the merge.
+        // This results in a tree with the changes the user didn't select.
+        let selected_diff = target
+            .diff_with_labels(
+                "parents of split revision",
+                "selected changes for split",
+                "split revision",
+            )
+            .await?;
+        MergedTree::merge(Merge::from_diffs(
+            (
+                target_tree,
+                format!("split revision ({})", target.commit.conflict_label()),
+            ),
+            [selected_diff.invert()],
+        ))
+        .await?
+    } else {
+        target_tree
+    };
+
+    let (first_description, second_description) = resolve_split_descriptions(
+        ui,
+        &mut tx,
+        &text_editor,
+        &target,
+        args,
+        parallel,
+        &second_tree,
+    )
+    .await?;
+
     // Create the first commit, which includes the changes selected by the user.
     let first_commit = {
         let mut commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
@@ -302,95 +338,27 @@ pub(crate) async fn cmd_split(
             // become divergent.
             commit_builder.generate_new_change_id();
         }
-        let use_editor = args.message_paragraphs.is_none() || args.editor;
-        let description = match &args.message_paragraphs {
-            Some(paragraphs) => join_message_paragraphs(paragraphs),
-            None => commit_builder.description().to_owned(),
-        };
-        // The first trailer would become the first line of the description.
-        // Also, a commit with no description is treated in a special way in
-        // jujutsu: it can be discarded as soon as it's no longer the working
-        // copy. Adding a trailer to an empty description would break that
-        // logic.
-        let description = if !description.is_empty() || use_editor {
-            commit_builder.set_description(description);
-            add_trailers(ui, &tx, &commit_builder).await?
-        } else {
-            description
-        };
-        let description = if use_editor {
-            commit_builder.set_description(description);
-            let temp_commit = commit_builder.write_hidden().await?;
-            let intro = "Enter a description for the selected changes.";
-            let template = description_template(ui, &tx, intro, &temp_commit)?;
-            edit_description(&text_editor, &template)?
-        } else {
-            description
-        };
-        commit_builder.set_description(description);
+        commit_builder.set_description(first_description);
         commit_builder.write(tx.repo_mut()).await?
     };
 
     // Create the second commit, which includes everything the user didn't
     // select.
     let second_commit = {
-        let target_tree = target.commit.tree();
-        let new_tree = if parallel {
-            // Merge the original commit tree with its parent using the tree
-            // containing the user selected changes as the base for the merge.
-            // This results in a tree with the changes the user didn't select.
-            let selected_diff = target
-                .diff_with_labels(
-                    "parents of split revision",
-                    "selected changes for split",
-                    "split revision",
-                )
-                .await?;
-            MergedTree::merge(Merge::from_diffs(
-                (
-                    target_tree,
-                    format!("split revision ({})", target.commit.conflict_label()),
-                ),
-                [selected_diff.invert()],
-            ))
-            .await?
-        } else {
-            target_tree
-        };
         let parents = if parallel {
             target.commit.parent_ids().to_vec()
         } else {
             vec![first_commit.id().clone()]
         };
         let mut commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
-        commit_builder.set_parents(parents).set_tree(new_tree);
-        let mut show_editor = args.editor;
+        commit_builder.set_parents(parents).set_tree(second_tree);
         if !use_move_flags {
             commit_builder.clear_rewrite_source();
             // Generate a new change id so that the commit being split doesn't
             // become divergent.
             commit_builder.generate_new_change_id();
         }
-        let description = if target.commit.description().is_empty() {
-            // If there was no description before, don't ask for one for the
-            // second commit.
-            "".to_string()
-        } else {
-            show_editor = show_editor || args.message_paragraphs.is_none();
-            // Just keep the original message unchanged
-            commit_builder.description().to_owned()
-        };
-        let description = if show_editor {
-            let new_description = add_trailers(ui, &tx, &commit_builder).await?;
-            commit_builder.set_description(new_description);
-            let temp_commit = commit_builder.write_hidden().await?;
-            let intro = "Enter a description for the remaining changes.";
-            let template = description_template(ui, &tx, intro, &temp_commit)?;
-            edit_description(&text_editor, &template)?
-        } else {
-            description
-        };
-        commit_builder.set_description(description);
+        commit_builder.set_description(second_description);
         commit_builder.write(tx.repo_mut()).await?
     };
 
@@ -597,4 +565,68 @@ The changes that are not selected will replace the original commit.
     }
 
     Ok(selection)
+}
+
+async fn resolve_split_descriptions(
+    ui: &Ui,
+    tx: &mut WorkspaceCommandTransaction<'_>,
+    text_editor: &TextEditor,
+    target: &CommitWithSelection,
+    args: &SplitArgs,
+    parallel: bool,
+    second_tree: &MergedTree,
+) -> Result<(String, String), CommandError> {
+    let use_first_editor = args.message_paragraphs.is_none() || args.editor;
+    let first_description = match &args.message_paragraphs {
+        Some(paragraphs) => join_message_paragraphs(paragraphs),
+        None => target.commit.description().to_owned(),
+    };
+    let mut first_commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
+    first_commit_builder.set_tree(target.selected_tree.clone());
+    let first_description = if !first_description.is_empty() || use_first_editor {
+        first_commit_builder.set_description(first_description);
+        add_trailers(ui, tx, &first_commit_builder).await?
+    } else {
+        first_description
+    };
+    let first_description = if use_first_editor {
+        first_commit_builder.set_description(first_description);
+        let temp_commit = first_commit_builder.write_hidden().await?;
+        let intro = "Enter a description for the selected changes.";
+        let template = description_template(ui, tx, intro, &temp_commit)?;
+        edit_description(text_editor, &template)?
+    } else {
+        first_description
+    };
+
+    let mut show_second_editor = args.editor;
+    let second_description = if target.commit.description().is_empty() {
+        "".to_string()
+    } else {
+        show_second_editor = show_second_editor || args.message_paragraphs.is_none();
+        target.commit.description().to_owned()
+    };
+    let second_description = if show_second_editor {
+        let parents = if parallel {
+            target.commit.parent_ids().to_vec()
+        } else {
+            first_commit_builder.set_description(&first_description);
+            let temp_first = first_commit_builder.write_hidden().await?;
+            vec![temp_first.id().clone()]
+        };
+        let mut second_commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
+        second_commit_builder
+            .set_parents(parents)
+            .set_tree(second_tree.clone());
+        let new_description = add_trailers(ui, tx, &second_commit_builder).await?;
+        second_commit_builder.set_description(new_description);
+        let temp_commit = second_commit_builder.write_hidden().await?;
+        let intro = "Enter a description for the remaining changes.";
+        let template = description_template(ui, tx, intro, &temp_commit)?;
+        edit_description(text_editor, &template)?
+    } else {
+        second_description
+    };
+
+    Ok((first_description, second_description))
 }
