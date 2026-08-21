@@ -1826,6 +1826,133 @@ fn test_split_identity_strategy() -> TestResult {
 }
 
 #[test]
+fn test_split_follow_description() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    let edit_script = test_env.set_up_fake_editor();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    // Configure fallback chain: follow-description then selected
+    test_env.add_config(r#"split.identity-strategy = ["follow-description", "selected"]"#);
+
+    // Setup commit with an original description
+    main_dir.run_jj(["desc", "-m", "original PR title"]).success();
+    main_dir.write_file("file1", "foo");
+    main_dir.write_file("file2", "foo");
+    main_dir
+        .run_jj(["bookmark", "set", "*le-signet*", "-r", "@"])
+        .success();
+
+    // Case 1: First commit keeps original description, second gets new description
+    // -> parent inherits original Change ID & bookmark
+    std::fs::write(
+        &edit_script,
+        [
+            "dump editor1",
+            "write\noriginal PR title",
+            "next invocation\n",
+            "dump editor2",
+            "write\nnew follow-up PR title",
+        ]
+        .join("\0"),
+    )?;
+    let output = main_dir.run_jj(["split", "file2"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Selected changes : qpvuntsm eefaa6a5 *le-signet* | original PR title
+    Remaining changes: mzvwutvl f4c7f0db new follow-up PR title
+    Working copy  (@) now at: mzvwutvl f4c7f0db new follow-up PR title
+    Parent commit (@-)      : qpvuntsm eefaa6a5 *le-signet* | original PR title
+    [EOF]
+    ");
+    insta::assert_snapshot!(get_log_output(&main_dir), @"
+    @  mzvwutvlkqwt false new follow-up PR title
+    ○  qpvuntsmwlqt false *le-signet* original PR title
+    ◆  zzzzzzzzzzzz true
+    [EOF]
+    ");
+
+    // Case 2: First commit gets new description, second retains original description
+    // -> child inherits original Change ID & bookmark
+    main_dir.run_jj(["undo"]).success();
+    std::fs::write(
+        &edit_script,
+        [
+            "dump editor1",
+            "write\nprerequisite refactoring",
+            "next invocation\n",
+            "dump editor2",
+            "write\noriginal PR title",
+        ]
+        .join("\0"),
+    )?;
+    let output = main_dir.run_jj(["split", "file2"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Selected changes : kkmpptxz cb6eb5bc prerequisite refactoring
+    Remaining changes: qpvuntsm 1fb9b71e *le-signet* | original PR title
+    Working copy  (@) now at: qpvuntsm 1fb9b71e *le-signet* | original PR title
+    Parent commit (@-)      : kkmpptxz cb6eb5bc prerequisite refactoring
+    [EOF]
+    ");
+    insta::assert_snapshot!(get_log_output(&main_dir), @"
+    @  qpvuntsmwlqt false *le-signet* original PR title
+    ○  kkmpptxzrspx false prerequisite refactoring
+    ◆  zzzzzzzzzzzz true
+    [EOF]
+    ");
+
+    // Case 3: Both descriptions modified -> yields to fallback strategy ("selected")
+    main_dir.run_jj(["undo"]).success();
+    std::fs::write(
+        &edit_script,
+        [
+            "dump editor1",
+            "write\nnew description 1",
+            "next invocation\n",
+            "dump editor2",
+            "write\nnew description 2",
+        ]
+        .join("\0"),
+    )?;
+    let output = main_dir.run_jj(["split", "file2"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Selected changes : qpvuntsm b47a24aa *le-signet* | new description 1
+    Remaining changes: mzvwutvl f4c7f0db new description 2
+    Working copy  (@) now at: mzvwutvl f4c7f0db new description 2
+    Parent commit (@-)      : qpvuntsm b47a24aa *le-signet* | new description 1
+    [EOF]
+    ");
+
+    // Case 4: Both descriptions modified with fallback strategy ("remaining")
+    main_dir.run_jj(["undo"]).success();
+    test_env.add_config(r#"split.identity-strategy = ["follow-description", "remaining"]"#);
+    std::fs::write(
+        &edit_script,
+        [
+            "dump editor1",
+            "write\nnew description 1",
+            "next invocation\n",
+            "dump editor2",
+            "write\nnew description 2",
+        ]
+        .join("\0"),
+    )?;
+    let output = main_dir.run_jj(["split", "file2"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Selected changes : kkmpptxz b47a24aa new description 1
+    Remaining changes: qpvuntsm f4c7f0db *le-signet* | new description 2
+    Working copy  (@) now at: qpvuntsm f4c7f0db *le-signet* | new description 2
+    Parent commit (@-)      : kkmpptxz b47a24aa new description 1
+    [EOF]
+    ");
+
+    Ok(())
+}
+
+#[test]
 fn test_split_with_editor_and_message_args() -> TestResult {
     let mut test_env = TestEnvironment::default();
     let edit_script = test_env.set_up_fake_editor();

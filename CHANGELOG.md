@@ -38,7 +38,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 * Added `split.identity-strategy` configuration setting to control which commit
   inherits the original Change ID and where bookmarks move after `jj split`.
-  Supported strategies are `"remaining"` (default) and `"selected"`.
+  Supported strategies are `"remaining"` (default), `"selected"`, and
+  `"follow-description"`.
 
 * New `merge_point()` revset function which (similar to `fork_point`) finds the
   point where multiple branches merge.

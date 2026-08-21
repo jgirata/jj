@@ -1412,16 +1412,24 @@ original Change ID and where bookmarks pointing to the split commit move.
 # Default upstream:
 identity-strategy = ["remaining"]
 
+# Stacked PR workflow with description matching:
+# identity-strategy = ["follow-description", "remaining"]
+
 # To keep Change ID and bookmarks with the selected commit:
 # identity-strategy = ["selected"]
 ```
 
-The available strategies are:
+The available strategies are evaluated in order:
 
-* `remaining`: The commit containing the remaining changes inherits the
+* `follow-description`: Compares the descriptions of the two split commits with
+  the original commit's description. If exactly one of the split commits retains
+  the non-empty original description, that commit inherits the Change ID and
+  bookmarks. If both were modified, both match, or the original description was
+  empty, this strategy yields to the next strategy in the chain.
+* `remaining`: Terminal strategy. The commit containing the remaining changes inherits the
   original Change ID and bookmarks move to it. The commit with the selected
   changes gets a new Change ID.
-* `selected`: The commit containing the selected changes inherits the
+* `selected`: Terminal strategy. The commit containing the selected changes inherits the
   original Change ID and bookmarks move to it. The commit with the remaining
   changes gets a new Change ID.
 

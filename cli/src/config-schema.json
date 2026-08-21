@@ -1039,7 +1039,8 @@
                         "type": "string",
                         "enum": [
                             "selected",
-                            "remaining"
+                            "remaining",
+                            "follow-description"
                         ]
                     },
                     "default": [

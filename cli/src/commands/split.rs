@@ -330,7 +330,13 @@ pub(crate) async fn cmd_split(
     )
     .await?;
 
-    let strategy = evaluate_strategy(ui, tx.settings())?;
+    let strategy = evaluate_strategy(
+        ui,
+        tx.settings(),
+        &target,
+        &first_description,
+        &second_description,
+    )?;
 
     // Create the first commit, which includes the changes selected by the user.
     let first_commit = {
@@ -660,6 +666,9 @@ pub(crate) enum ResolvedStrategy {
 fn evaluate_strategy(
     ui: &Ui,
     settings: &UserSettings,
+    target: &CommitWithSelection,
+    first_description: &str,
+    second_description: &str,
 ) -> Result<ResolvedStrategy, CommandError> {
     let legacy_behavior = settings
         .get_bool("split.legacy-bookmark-behavior")
@@ -692,6 +701,18 @@ fn evaluate_strategy(
         match strategy.as_str() {
             "selected" => return Ok(ResolvedStrategy::Selected),
             "remaining" => return Ok(ResolvedStrategy::Remaining),
+            "follow-description" => {
+                let orig_desc = target.commit.description();
+                if !orig_desc.is_empty() {
+                    let first_matches = first_description == orig_desc;
+                    let second_matches = second_description == orig_desc;
+                    match (first_matches, second_matches) {
+                        (true, false) => return Ok(ResolvedStrategy::Selected),
+                        (false, true) => return Ok(ResolvedStrategy::Remaining),
+                        _ => {} // Ambiguous or both edited; yield to next strategy in chain
+                    }
+                }
+            }
             other => {
                 return Err(crate::command_error::user_error(format!(
                     "Invalid identity strategy `{other}`."
