@@ -1679,6 +1679,153 @@ fn test_split_with_bookmarks(bookmark_behavior: BookmarkBehavior) -> TestResult 
 }
 
 #[test]
+fn test_split_identity_strategy() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    let edit_script = test_env.set_up_fake_editor();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    // Setup.
+    main_dir.run_jj(["desc", "-m", "first-commit"]).success();
+    main_dir.write_file("file1", "foo");
+    main_dir.write_file("file2", "foo");
+    main_dir
+        .run_jj(["bookmark", "set", "*le-signet*", "-r", "@"])
+        .success();
+
+    // 1. Test strategy ["selected"]: parent keeps Change ID and bookmark
+    test_env.add_config(r#"split.identity-strategy = ["selected"]"#);
+    std::fs::write(
+        &edit_script,
+        ["", "next invocation\n", "write\nsecond-commit"].join("\0"),
+    )?;
+    let output = main_dir.run_jj(["split", "file2"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Selected changes : qpvuntsm a481fe8a *le-signet* | first-commit
+    Remaining changes: mzvwutvl 5f597a6e second-commit
+    Working copy  (@) now at: mzvwutvl 5f597a6e second-commit
+    Parent commit (@-)      : qpvuntsm a481fe8a *le-signet* | first-commit
+    [EOF]
+    ");
+    insta::assert_snapshot!(get_log_output(&main_dir), @"
+    @  mzvwutvlkqwt false second-commit
+    ○  qpvuntsmwlqt false *le-signet* first-commit
+    ◆  zzzzzzzzzzzz true
+    [EOF]
+    ");
+
+    // 2. Test strategy ["remaining"]: child keeps Change ID and bookmark
+    main_dir.run_jj(["undo"]).success();
+    test_env.add_config(r#"split.identity-strategy = ["remaining"]"#);
+    std::fs::write(
+        &edit_script,
+        ["", "next invocation\n", "write\nsecond-commit"].join("\0"),
+    )?;
+    let output = main_dir.run_jj(["split", "file2"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Selected changes : kkmpptxz a481fe8a first-commit
+    Remaining changes: qpvuntsm 5f597a6e *le-signet* | second-commit
+    Working copy  (@) now at: qpvuntsm 5f597a6e *le-signet* | second-commit
+    Parent commit (@-)      : kkmpptxz a481fe8a first-commit
+    [EOF]
+    ");
+    insta::assert_snapshot!(get_log_output(&main_dir), @"
+    @  qpvuntsmwlqt false *le-signet* second-commit
+    ○  kkmpptxzrspx false first-commit
+    ◆  zzzzzzzzzzzz true
+    [EOF]
+    ");
+
+    // 3. Test invalid strategy produces user error
+    main_dir.run_jj(["undo"]).success();
+    test_env.add_config(r#"split.identity-strategy = ["invalid-strategy"]"#);
+    let output = main_dir.run_jj(["split", "file2"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: Invalid identity strategy `invalid-strategy`.
+    [EOF]
+    [exit status: 1]
+    ");
+
+    // 4. Test legacy-bookmark-behavior = false fallback with warning
+    main_dir.run_jj(["undo"]).success();
+    test_env.add_config(
+        r#"
+        split.identity-strategy = []
+        split.legacy-bookmark-behavior = false
+        "#,
+    );
+    // Remove identity-strategy so legacy fallback triggers
+    test_env.add_config(r#"split.legacy-bookmark-behavior = false"#);
+    std::fs::write(
+        &edit_script,
+        ["", "next invocation\n", "write\nsecond-commit"].join("\0"),
+    )?;
+    let output = main_dir.run_jj([
+        "--config=split.identity-strategy=[]",
+        "split",
+        "file2",
+    ]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Warning: The `split.legacy-bookmark-behavior` setting is deprecated; use `split.identity-strategy` instead.
+    Selected changes : qpvuntsm a481fe8a *le-signet* | first-commit
+    Remaining changes: mzvwutvl 5f597a6e second-commit
+    Working copy  (@) now at: mzvwutvl 5f597a6e second-commit
+    Parent commit (@-)      : qpvuntsm a481fe8a *le-signet* | first-commit
+    [EOF]
+    ");
+
+    // 5. Test legacy-bookmark-behavior = true fallback with warning
+    main_dir.run_jj(["undo"]).success();
+    std::fs::write(
+        &edit_script,
+        ["", "next invocation\n", "write\nsecond-commit"].join("\0"),
+    )?;
+    let output = main_dir.run_jj([
+        "--config=split.identity-strategy=[]",
+        "--config=split.legacy-bookmark-behavior=true",
+        "split",
+        "file2",
+    ]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Warning: The `split.legacy-bookmark-behavior` setting is deprecated; use `split.identity-strategy` instead.
+    Selected changes : kkmpptxz a481fe8a first-commit
+    Remaining changes: qpvuntsm 5f597a6e *le-signet* | second-commit
+    Working copy  (@) now at: qpvuntsm 5f597a6e *le-signet* | second-commit
+    Parent commit (@-)      : kkmpptxz a481fe8a first-commit
+    [EOF]
+    ");
+
+    // 6. Test warning is emitted even if identity-strategy is also configured (overriding legacy setting)
+    main_dir.run_jj(["undo"]).success();
+    std::fs::write(
+        &edit_script,
+        ["", "next invocation\n", "write\nsecond-commit"].join("\0"),
+    )?;
+    let output = main_dir.run_jj([
+        "--config=split.identity-strategy=[\"selected\"]",
+        "--config=split.legacy-bookmark-behavior=true",
+        "split",
+        "file2",
+    ]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Warning: The `split.legacy-bookmark-behavior` setting is deprecated; use `split.identity-strategy` instead.
+    Selected changes : qpvuntsm a481fe8a *le-signet* | first-commit
+    Remaining changes: mzvwutvl 5f597a6e second-commit
+    Working copy  (@) now at: mzvwutvl 5f597a6e second-commit
+    Parent commit (@-)      : qpvuntsm a481fe8a *le-signet* | first-commit
+    [EOF]
+    ");
+
+    Ok(())
+}
+
+#[test]
 fn test_split_with_editor_and_message_args() -> TestResult {
     let mut test_env = TestEnvironment::default();
     let edit_script = test_env.set_up_fake_editor();

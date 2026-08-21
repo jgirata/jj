@@ -18,6 +18,7 @@ use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
+use jj_lib::config::ConfigGetResultExt as _;
 use jj_lib::matchers::Matcher;
 use jj_lib::merge::Diff;
 use jj_lib::merge::Merge;
@@ -32,6 +33,7 @@ use jj_lib::rewrite::RebaseOptions;
 use jj_lib::rewrite::RebasedCommit;
 use jj_lib::rewrite::RewriteRefsOptions;
 use jj_lib::rewrite::move_commits;
+use jj_lib::settings::UserSettings;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
@@ -328,11 +330,17 @@ pub(crate) async fn cmd_split(
     )
     .await?;
 
+    let strategy = evaluate_strategy(ui, tx.settings())?;
+
     // Create the first commit, which includes the changes selected by the user.
     let first_commit = {
         let mut commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
         commit_builder.set_tree(target.selected_tree.clone());
-        if use_move_flags {
+        let is_first_successor = match strategy {
+            ResolvedStrategy::Selected => true,
+            ResolvedStrategy::Remaining => false,
+        };
+        if !is_first_successor || use_move_flags {
             commit_builder.clear_rewrite_source();
             // Generate a new change id so that the commit being split doesn't
             // become divergent.
@@ -352,7 +360,11 @@ pub(crate) async fn cmd_split(
         };
         let mut commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
         commit_builder.set_parents(parents).set_tree(second_tree);
-        if !use_move_flags {
+        let is_second_successor = match strategy {
+            ResolvedStrategy::Selected => false,
+            ResolvedStrategy::Remaining => true,
+        };
+        if !is_second_successor && !use_move_flags {
             commit_builder.clear_rewrite_source();
             // Generate a new change id so that the commit being split doesn't
             // become divergent.
@@ -373,7 +385,15 @@ pub(crate) async fn cmd_split(
         )
         .await?
     } else {
-        rewrite_descendants(&mut tx, &target, first_commit, second_commit, parallel).await?
+        rewrite_descendants(
+            &mut tx,
+            &target,
+            first_commit,
+            second_commit,
+            parallel,
+            strategy,
+        )
+        .await?
     };
     if let Some(mut formatter) = ui.status_formatter() {
         if num_rebased > 0 {
@@ -468,9 +488,9 @@ async fn rewrite_descendants(
     first_commit: Commit,
     second_commit: Commit,
     parallel: bool,
+    strategy: ResolvedStrategy,
 ) -> Result<(Commit, Commit, usize), CommandError> {
-    let legacy_bookmark_behavior = tx.settings().get_bool("split.legacy-bookmark-behavior")?;
-    if legacy_bookmark_behavior {
+    if strategy == ResolvedStrategy::Remaining {
         // Mark the commit being split as rewritten to the second commit. This
         // moves any bookmarks pointing to the target commit to the second
         // commit.
@@ -483,7 +503,7 @@ async fn rewrite_descendants(
             vec![target.commit.id().clone()],
             async |mut rewriter: CommitRewriter<'_>| {
                 num_rebased += 1;
-                if parallel && legacy_bookmark_behavior {
+                if parallel && strategy == ResolvedStrategy::Remaining {
                     // The old_parent is the second commit due to the rewrite above.
                     rewriter.replace_parent(
                         second_commit.id(),
@@ -629,4 +649,56 @@ async fn resolve_split_descriptions(
     };
 
     Ok((first_description, second_description))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedStrategy {
+    Selected,
+    Remaining,
+}
+
+fn evaluate_strategy(
+    ui: &Ui,
+    settings: &UserSettings,
+) -> Result<ResolvedStrategy, CommandError> {
+    let legacy_behavior = settings
+        .get_bool("split.legacy-bookmark-behavior")
+        .optional()?;
+    if legacy_behavior.is_some() {
+        // TODO: remove in jj v0.50+
+        writeln!(
+            ui.warning_default(),
+            "The `split.legacy-bookmark-behavior` setting is deprecated; use `split.identity-strategy` instead."
+        )?;
+    }
+
+    let strategies: Vec<String> = if let Ok(list) =
+        settings.get::<Vec<String>>("split.identity-strategy")
+    {
+        list
+    } else if let Some(single) = settings.get_string("split.identity-strategy").optional()? {
+        vec![single]
+    } else if let Some(legacy_behavior) = legacy_behavior {
+        if legacy_behavior {
+            vec!["remaining".to_string()]
+        } else {
+            vec!["selected".to_string()]
+        }
+    } else {
+        vec!["remaining".to_string()]
+    };
+
+    for strategy in &strategies {
+        match strategy.as_str() {
+            "selected" => return Ok(ResolvedStrategy::Selected),
+            "remaining" => return Ok(ResolvedStrategy::Remaining),
+            other => {
+                return Err(crate::command_error::user_error(format!(
+                    "Invalid identity strategy `{other}`."
+                )));
+            }
+        }
+    }
+
+    Ok(ResolvedStrategy::Remaining)
 }
