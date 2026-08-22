@@ -1055,7 +1055,8 @@
                         "enum": [
                             "selected",
                             "remaining",
-                            "follow-description"
+                            "follow-description",
+                            "prompt"
                         ]
                     },
                     "default": [

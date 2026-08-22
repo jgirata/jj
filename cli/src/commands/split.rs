@@ -368,11 +368,12 @@ pub(crate) async fn cmd_split(
     second_commit_builder.set_description(&second_description);
 
     let identity_recipient = resolve_identity_recipient(
+        ui,
         &strategies,
         &target,
         &first_description,
         &second_description,
-    );
+    )?;
 
     if identity_recipient != tentative_recipient {
         match identity_recipient {
@@ -695,6 +696,7 @@ pub(crate) enum IdentityStrategy {
     Selected,
     Remaining,
     FollowDescription,
+    Prompt,
 }
 
 impl IdentityStrategy {
@@ -703,6 +705,7 @@ impl IdentityStrategy {
             "selected" => Ok(Self::Selected),
             "remaining" => Ok(Self::Remaining),
             "follow-description" => Ok(Self::FollowDescription),
+            "prompt" => Ok(Self::Prompt),
             other => Err(user_error(format!("Invalid identity strategy `{other}`."))),
         }
     }
@@ -731,36 +734,95 @@ fn find_static_identity_recipient(strategies: &[IdentityStrategy]) -> IdentityRe
         match strategy {
             IdentityStrategy::Selected => return IdentityRecipient::Selected,
             IdentityStrategy::Remaining => return IdentityRecipient::Remaining,
-            IdentityStrategy::FollowDescription => {}
+            IdentityStrategy::FollowDescription | IdentityStrategy::Prompt => {}
         }
     }
     IdentityRecipient::Remaining
 }
 
 fn resolve_identity_recipient(
+    ui: &Ui,
     strategies: &[IdentityStrategy],
     target: &CommitWithSelection,
     first_description: &str,
     second_description: &str,
-) -> IdentityRecipient {
+) -> Result<IdentityRecipient, CommandError> {
     for strategy in strategies {
         match strategy {
-            IdentityStrategy::Selected => return IdentityRecipient::Selected,
-            IdentityStrategy::Remaining => return IdentityRecipient::Remaining,
+            IdentityStrategy::Selected => return Ok(IdentityRecipient::Selected),
+            IdentityStrategy::Remaining => return Ok(IdentityRecipient::Remaining),
             IdentityStrategy::FollowDescription => {
                 let orig_desc = target.commit.description();
                 if !orig_desc.is_empty() {
                     let first_matches = first_description == orig_desc;
                     let second_matches = second_description == orig_desc;
                     match (first_matches, second_matches) {
-                        (true, false) => return IdentityRecipient::Selected,
-                        (false, true) => return IdentityRecipient::Remaining,
+                        (true, false) => return Ok(IdentityRecipient::Selected),
+                        (false, true) => return Ok(IdentityRecipient::Remaining),
                         _ => {} // Ambiguous or both edited; yield to next strategy in chain
                     }
+                }
+            }
+            IdentityStrategy::Prompt => {
+                if let Some(resolved) =
+                    prompt_for_identity_recipient(ui, first_description, second_description)?
+                {
+                    return Ok(resolved);
                 }
             }
         }
     }
 
-    IdentityRecipient::Remaining
+    Ok(IdentityRecipient::Remaining)
+}
+
+fn prompt_for_identity_recipient(
+    ui: &Ui,
+    first_description: &str,
+    second_description: &str,
+) -> Result<Option<IdentityRecipient>, CommandError> {
+    if !ui.can_prompt() {
+        return Ok(None);
+    }
+
+    let mut formatter = ui.stderr_formatter();
+    writeln!(
+        formatter,
+        "Choose which commit retains the change ID and bookmarks:"
+    )?;
+    writeln!(
+        formatter,
+        "1: {}",
+        format_choice_line("Selected changes", first_description)
+    )?;
+    writeln!(
+        formatter,
+        "2: {}",
+        format_choice_line("Remaining changes", second_description)
+    )?;
+    writeln!(formatter, "q: abort")?;
+    drop(formatter);
+
+    let choices = ["1", "2", "q"];
+    let choice_idx = ui.prompt_choice(
+        "Enter the index of the commit to retain change ID and bookmarks",
+        &choices,
+        None,
+    )?;
+
+    match choices[choice_idx] {
+        "1" => Ok(Some(IdentityRecipient::Selected)),
+        "2" => Ok(Some(IdentityRecipient::Remaining)),
+        "q" => Err(user_error("Split aborted by user.")),
+        _ => unreachable!(),
+    }
+}
+
+fn format_choice_line(label: &str, description: &str) -> String {
+    let first_line = description.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        format!("{label} (no description set)")
+    } else {
+        format!("{label}: {first_line}")
+    }
 }

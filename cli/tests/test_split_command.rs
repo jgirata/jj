@@ -20,6 +20,7 @@ use testutils::TestResult;
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+use crate::common::force_interactive;
 
 #[must_use]
 fn get_log_output(work_dir: &TestWorkDir) -> CommandOutput {
@@ -2099,6 +2100,176 @@ fn test_split_follow_description() -> TestResult {
     @  pzsxstztnpkv false
     ○  qpvuntsmwlqt false *le-signet* first description
     ◆  zzzzzzzzzzzz true
+    [EOF]
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn test_split_prompt_strategy() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    let edit_script = test_env.set_up_fake_editor();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    test_env.add_config(r#"split.identity-strategy = ["prompt"]"#);
+
+    main_dir
+        .run_jj(["desc", "-m", "original PR title"])
+        .success();
+    main_dir.write_file("file1", "foo");
+    main_dir.write_file("file2", "foo");
+    main_dir
+        .run_jj(["bookmark", "set", "*le-signet*", "-r", "@"])
+        .success();
+
+    std::fs::write(
+        &edit_script,
+        [
+            "dump editor1",
+            "write\nselected commit description",
+            "next invocation\n",
+            "dump editor2",
+            "write\nremaining commit description",
+        ]
+        .join("\0"),
+    )?;
+
+    // Case 1: Prompt chooses 1 -> selected commit retains change ID and bookmark
+    let output = main_dir.run_jj_with(|cmd| {
+        force_interactive(cmd)
+            .args(["split", "file2"])
+            .write_stdin("1\n")
+    });
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Choose which commit retains the change ID and bookmarks:
+    1: Selected changes: selected commit description
+    2: Remaining changes: remaining commit description
+    q: abort
+    Enter the index of the commit to retain change ID and bookmarks: Selected changes : qpvuntsm b9b1b5c1 *le-signet* | selected commit description
+    Remaining changes: rzvqmyuk 29fcb9ee remaining commit description
+    Working copy  (@) now at: rzvqmyuk 29fcb9ee remaining commit description
+    Parent commit (@-)      : qpvuntsm b9b1b5c1 *le-signet* | selected commit description
+    [EOF]
+    ");
+
+    // Case 2: Prompt chooses 2 -> remaining commit retains change ID and bookmark
+    main_dir.run_jj(["undo"]).success();
+    std::fs::write(
+        &edit_script,
+        [
+            "dump editor1",
+            "write\nselected commit description",
+            "next invocation\n",
+            "dump editor2",
+            "write\nremaining commit description",
+        ]
+        .join("\0"),
+    )?;
+    let output = main_dir.run_jj_with(|cmd| {
+        force_interactive(cmd)
+            .args(["split", "file2"])
+            .write_stdin("2\n")
+    });
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Choose which commit retains the change ID and bookmarks:
+    1: Selected changes: selected commit description
+    2: Remaining changes: remaining commit description
+    q: abort
+    Enter the index of the commit to retain change ID and bookmarks: Selected changes : royxmykx 039c1264 selected commit description
+    Remaining changes: qpvuntsm 39c46934 *le-signet* | remaining commit description
+    Working copy  (@) now at: qpvuntsm 39c46934 *le-signet* | remaining commit description
+    Parent commit (@-)      : royxmykx 039c1264 selected commit description
+    [EOF]
+    ");
+
+    // Case 3: Prompt inputs unrecognized responses (letters, out-of-range numbers)
+    // before entering 1
+    main_dir.run_jj(["undo"]).success();
+    std::fs::write(
+        &edit_script,
+        [
+            "dump editor1",
+            "write\nselected commit description",
+            "next invocation\n",
+            "dump editor2",
+            "write\nremaining commit description",
+        ]
+        .join("\0"),
+    )?;
+    let output = main_dir.run_jj_with(|cmd| {
+        force_interactive(cmd)
+            .args(["split", "file2"])
+            .write_stdin("s\n3\n1\n")
+    });
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Choose which commit retains the change ID and bookmarks:
+    1: Selected changes: selected commit description
+    2: Remaining changes: remaining commit description
+    q: abort
+    Enter the index of the commit to retain change ID and bookmarks: unrecognized response
+    Enter the index of the commit to retain change ID and bookmarks: unrecognized response
+    Enter the index of the commit to retain change ID and bookmarks: Selected changes : qpvuntsm 1017f882 *le-signet* | selected commit description
+    Remaining changes: nuwvvtmy 24c1b38b remaining commit description
+    Working copy  (@) now at: nuwvvtmy 24c1b38b remaining commit description
+    Parent commit (@-)      : qpvuntsm 1017f882 *le-signet* | selected commit description
+    [EOF]
+    ");
+
+    // Case 4: Prompt chooses q -> aborts
+    main_dir.run_jj(["undo"]).success();
+    std::fs::write(
+        &edit_script,
+        [
+            "dump editor1",
+            "write\nselected commit description",
+            "next invocation\n",
+            "dump editor2",
+            "write\nremaining commit description",
+        ]
+        .join("\0"),
+    )?;
+    let output = main_dir.run_jj_with(|cmd| {
+        force_interactive(cmd)
+            .args(["split", "file2"])
+            .write_stdin("q\n")
+    });
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Choose which commit retains the change ID and bookmarks:
+    1: Selected changes: selected commit description
+    2: Remaining changes: remaining commit description
+    q: abort
+    Enter the index of the commit to retain change ID and bookmarks: Error: Split aborted by user.
+    [EOF]
+    [exit status: 1]
+    ");
+
+    // Case 5: Non-interactive session falls back to next strategy in chain
+    main_dir.run_jj(["undo"]).success();
+    test_env.add_config(r#"split.identity-strategy = ["prompt", "selected"]"#);
+    std::fs::write(
+        &edit_script,
+        [
+            "dump editor1",
+            "write\nselected commit description",
+            "next invocation\n",
+            "dump editor2",
+            "write\nremaining commit description",
+        ]
+        .join("\0"),
+    )?;
+    let output = main_dir.run_jj(["split", "file2"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Selected changes : qpvuntsm 07acbe5f selected commit description
+    Remaining changes: kmkuslsw dce465e7 remaining commit description
+    Working copy  (@) now at: kmkuslsw dce465e7 remaining commit description
+    Parent commit (@-)      : qpvuntsm 07acbe5f selected commit description
     [EOF]
     ");
 
